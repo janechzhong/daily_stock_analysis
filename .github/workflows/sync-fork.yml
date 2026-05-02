@@ -1,0 +1,92 @@
+name: Sync Fork from Upstream
+
+on:
+  schedule:
+    # Every 6 hours (UTC)
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force sync even if already up-to-date'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/ZhuLinsen/daily_stock_analysis.git
+          git fetch upstream main
+
+      - name: Check if sync needed
+        id: check
+        run: |
+          UPSTREAM_SHA=$(git rev-parse upstream/main)
+          ORIGIN_SHA=$(git rev-parse origin/main)
+          echo "upstream_sha=$UPSTREAM_SHA" >> $GITHUB_OUTPUT
+          echo "origin_sha=$ORIGIN_SHA" >> $GITHUB_OUTPUT
+          if [ "$UPSTREAM_SHA" = "$ORIGIN_SHA" ] && [ "${{ github.event.inputs.force }}" != "true" ]; then
+            echo "synced=false" >> $GITHUB_OUTPUT
+            echo "✅ Already up-to-date: $ORIGIN_SHA"
+          else
+            echo "synced=true" >> $GITHUB_OUTPUT
+            echo "⬆️ Upstream has updates: $UPSTREAM_SHA"
+          fi
+
+      - name: Merge upstream
+        if: steps.check.outputs.synced == 'true'
+        id: merge
+        run: |
+          git merge upstream/main --no-edit -m "🔄 Auto-sync from upstream/main" && echo "merged=true" >> $GITHUB_OUTPUT || echo "merged=false" >> $GITHUB_OUTPUT
+
+      - name: Push merged changes
+        if: steps.merge.outputs.merged == 'true'
+        run: |
+          git push origin main
+          echo "🚀 Pushed to origin/main"
+
+      - name: Create conflict issue
+        if: steps.merge.outputs.merged == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const upstreamSha = '${{ steps.check.outputs.upstream_sha }}'.substring(0, 7);
+            const title = `⚠️ Sync conflict with upstream at ${upstreamSha}`;
+            
+            // Check if an open conflict issue already exists
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: ['sync-conflict'],
+            });
+            
+            if (issues.length === 0) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: `## 🔴 Fork Sync Conflict\n\nAuto-sync from [upstream](https://github.com/ZhuLinsen/daily_stock_analysis) failed due to merge conflicts.\n\n### Resolution Steps\n\`\`\`bash\ngit clone https://github.com/${context.repo.owner}/${context.repo.repo}.git\ncd ${context.repo.repo}\ngit remote add upstream https://github.com/ZhuLinsen/daily_stock_analysis.git\ngit fetch upstream main\ngit merge upstream/main\n# Resolve conflicts, then:\ngit push origin main\n\`\`\`\n\nUpstream commit: \`${upstreamSha}\``,
+                labels: ['sync-conflict'],
+              });
+              console.log('Created conflict notification issue');
+            } else {
+              console.log('Conflict issue already exists, skipping');
+            }
